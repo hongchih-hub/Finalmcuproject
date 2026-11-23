@@ -1,1 +1,103 @@
+!!!不可複製!!! 以下要一個個填入對應區塊
+屆時可重新生成
 
+/* USER CODE BEGIN PV */ // 使用者全域變數區起始
+volatile uint8_t uartRxByte = 0; // 序列埠中斷單一位元組接收緩衝
+volatile uint8_t currentCmd = 'N'; // 儲存最新有效控制指令預設為待機N
+volatile uint32_t lastRxTick = 0; // 記錄最後收到指令的系統毫秒數
+
+const uint32_t COMM_TIMEOUT_MS = 500; // 通訊斷線保護超時門檻500毫秒
+const uint32_t TURN_BLINK_MS = 300; // 方向燈標準閃爍半週期300毫秒
+const uint32_t FAIL_BLINK_MS = 250; // 斷線警示雙閃半週期250毫秒
+
+const uint16_t PWM_OFF = 0; // 燈片完全熄滅對應佔空比0
+const uint16_t PWM_STANDBY = 200; // 待機夜間示寬對應佔空比20百分比
+const uint16_t PWM_FULL = 1000; // 煞車與方向燈全亮對應佔空比100百分比
+
+uint32_t lastBlinkTick = 0; // 記錄上次閃爍切換的系統毫秒數
+uint8_t blinkFlag = 0; // 記錄目前閃爍亮滅旗標
+/* USER CODE END PV */ // 使用者全域變數區結束
+
+/* USER CODE BEGIN 0 */ // 使用者回呼與輔助函式區起始
+void Set_Helmet_Lights(uint16_t centerPwm, uint16_t leftPwm, uint16_t rightPwm) // 統一更新三片燈片PWM輸出函式
+{ // 進入燈片設定函式
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, centerPwm); // 更新中間紅光煞車燈佔空比
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, leftPwm); // 更新左側黃光方向燈佔空比
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, rightPwm); // 更新右側黃光方向燈佔空比
+} // 結束燈片設定函式
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) // 序列埠接收完成中斷回呼函式
+{ // 進入接收回呼函式
+  if (huart->Instance == USART1) // 確認觸發來源為連接ESP32的USART1
+  { // 進入USART1處理區塊
+    if (uartRxByte == 'L' || uartRxByte == 'R' || uartRxByte == 'B' || uartRxByte == 'N') // 檢查是否為合法控制字元
+    { // 進入合法字元處理區塊
+      currentCmd = uartRxByte; // 更新目前執行指令
+      lastRxTick = HAL_GetTick(); // 重置斷線超時計時器
+    } // 結束合法字元檢查
+    HAL_UART_Receive_IT(&huart1, (uint8_t *)&uartRxByte, 1); // 重新啟動下一次單字元中斷接收
+  } // 結束USART1來源判斷
+} // 結束接收回呼函式
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) // 序列埠異常錯誤恢復回呼函式
+{ // 進入錯誤恢復函式
+  if (huart->Instance == USART1) // 確認異常來源為USART1
+  { // 進入USART1錯誤處理區塊
+    __HAL_UART_CLEAR_OREFLAG(huart); // 清除溢位錯誤旗標避免接收中斷卡死
+    HAL_UART_Receive_IT(&huart1, (uint8_t *)&uartRxByte, 1); // 強制重啟序列埠中斷接收
+  } // 結束來源判斷
+} // 結束錯誤恢復函式
+/* USER CODE END 0 */ // 使用者回呼與輔助函式區結束
+
+/* USER CODE BEGIN 2 */ // 主程式啟動初始化區起始
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1); // 啟動中間紅光煞車燈PWM輸出
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2); // 啟動左側黃光方向燈PWM輸出
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3); // 啟動右側黃光方向燈PWM輸出
+  Set_Helmet_Lights(PWM_OFF, PWM_OFF, PWM_OFF); // 開機預設全燈片熄滅
+  lastRxTick = HAL_GetTick(); // 初始化開機接收時間基準
+  HAL_UART_Receive_IT(&huart1, (uint8_t *)&uartRxByte, 1); // 啟動第一次序列埠中斷接收
+  /* USER CODE END 2 */ // 主程式啟動初始化區結束
+
+  /* USER CODE BEGIN WHILE */ // 主迴圈狀態機起始
+  while (1) // 無窮主迴圈
+  { // 進入主迴圈
+    uint32_t now = HAL_GetTick(); // 取得目前系統運行毫秒數
+
+    if ((now - lastRxTick) > COMM_TIMEOUT_MS) // 第一軟體優先權檢查是否超時500毫秒斷線
+    { // 進入通訊斷線保護模式
+      if ((now - lastBlinkTick) >= FAIL_BLINK_MS) // 檢查是否達到250毫秒切換間隔
+      { // 進入閃爍狀態切換
+        lastBlinkTick = now; // 更新閃爍計時器
+        blinkFlag = !blinkFlag; // 反轉閃爍旗標
+      } // 結束間隔檢查
+      uint16_t warnPwm = blinkFlag ? PWM_FULL : PWM_OFF; // 決定警示燈亮滅數值
+      Set_Helmet_Lights(PWM_OFF, warnPwm, warnPwm); // 左右方向燈同步雙閃提示斷線
+    } // 結束斷線保護模式
+    else if (currentCmd == 'L') // 第二軟體優先權左轉方向燈模式
+    { // 進入左轉模式
+      if ((now - lastBlinkTick) >= TURN_BLINK_MS) // 檢查是否達到300毫秒閃爍間隔
+      { // 進入閃爍狀態切換
+        lastBlinkTick = now; // 更新閃爍計時器
+        blinkFlag = !blinkFlag; // 反轉閃爍旗標
+      } // 結束間隔檢查
+      Set_Helmet_Lights(PWM_STANDBY, blinkFlag ? PWM_FULL : PWM_OFF, PWM_OFF); // 中間維持示寬左側黃燈閃爍
+    } // 結束左轉模式
+    else if (currentCmd == 'R') // 第二軟體優先權右轉方向燈模式
+    { // 進入右轉模式
+      if ((now - lastBlinkTick) >= TURN_BLINK_MS) // 檢查是否達到300毫秒閃爍間隔
+      { // 進入閃爍狀態切換
+        lastBlinkTick = now; // 更新閃爍計時器
+        blinkFlag = !blinkFlag; // 反轉閃爍旗標
+      } // 結束間隔檢查
+      Set_Helmet_Lights(PWM_STANDBY, PWM_OFF, blinkFlag ? PWM_FULL : PWM_OFF); // 中間維持示寬右側黃燈閃爍
+    } // 結束右轉模式
+    else if (currentCmd == 'B') // 第三軟體優先權煞車警示模式
+    { // 進入煞車模式
+      Set_Helmet_Lights(PWM_FULL, PWM_OFF, PWM_OFF); // 中間紅光100百分比全亮左右熄滅
+    } // 結束煞車模式
+    else // 第四軟體優先權待機示寬模式
+    { // 進入待機模式
+      Set_Helmet_Lights(PWM_STANDBY, PWM_OFF, PWM_OFF); // 中間紅光維持20百分比微亮示寬
+    } // 結束待機模式
+
+    /* USER CODE END WHILE */ // 主迴圈使用者程式結束
