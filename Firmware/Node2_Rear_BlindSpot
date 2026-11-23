@@ -1,1 +1,129 @@
+#include <WiFi.h> // 引入無線網路函式庫
+#include <esp_now.h> // 引入無線點對點通訊函式庫
+#include <esp_wifi.h> // 引入底層頻道設定函式庫
+#include <Wire.h> // 引入I2C通訊函式庫
+#include <VL53L1X.h> // 引入Pololu雷射測距函式庫
+#include <esp_task_wdt.h> // 引入硬體看門狗防當機函式庫
 
+const int PIN_SDA = 8; // 定義I2C資料腳位
+const int PIN_SCL = 9; // 定義I2C時脈腳位
+const int PIN_XSHUT_L = 4; // 定義左側測距模組開關腳位
+const int PIN_XSHUT_R = 5; // 定義右側測距模組開關腳位
+
+const uint16_t MIN_DIST_MM = 50; // 過濾近距離雜訊最小門檻毫米
+const uint16_t ALERT_DIST_MM = 1800; // 盲區警戒距離門檻毫米可調整1500至2000
+const unsigned long SEND_INTERVAL_MS = 50; // 每50毫秒回傳狀態與心跳封包
+
+uint8_t frontMac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // 請替換為車頭端Node1實際MAC位址
+
+VL53L1X sensorL; // 建立左側雷射感測器物件
+VL53L1X sensorR; // 建立右側雷射感測器物件
+
+bool leftOk = false; // 記錄左側感測器是否初始化成功
+bool rightOk = false; // 記錄右側感測器是否初始化成功
+uint16_t distL = 9999; // 儲存左側最新有效測距數值
+uint16_t distR = 9999; // 儲存右側最新有效測距數值
+unsigned long lastSendTime = 0; // 記錄上次傳送封包時間點
+
+void setupWatchdog() { // 初始化看門狗防死當函式
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3 // 判斷是否為新版核心
+  esp_task_wdt_config_t wdtConfig = { // 建立新版看門狗設定結構
+    .timeout_ms = 3000, // 設定3秒未餵狗自動重啟
+    .idle_core_mask = 0, // 不監控閒置核心
+    .trigger_panic = true // 超時觸發系統重置
+  }; // 結束結構設定
+  esp_task_wdt_reconfigure(&wdtConfig); // 套用看門狗設定參數
+  esp_task_wdt_add(NULL); // 將目前主任務加入看門狗監控
+#else // 舊版核心分支
+  esp_task_wdt_init(3, true); // 設定3秒看門狗並啟用超時重置
+  esp_task_wdt_add(NULL); // 將目前主任務加入看門狗監控
+#endif // 結束版本判斷
+} // 結束看門狗初始化函式
+
+void setup() { // 開機初始化函式
+  Serial.begin(115200); // 啟動序列埠監控除錯用
+  pinMode(PIN_XSHUT_L, OUTPUT); // 設定左側XSHUT為輸出
+  pinMode(PIN_XSHUT_R, OUTPUT); // 設定右側XSHUT為輸出
+  digitalWrite(PIN_XSHUT_L, LOW); // 先將左側測距模組硬體關機
+  digitalWrite(PIN_XSHUT_R, LOW); // 先將右側測距模組硬體關機
+  delay(20); // 等待兩顆模組完全斷電復位
+
+  Wire.begin(PIN_SDA, PIN_SCL); // 初始化I2C匯流排腳位
+  Wire.setClock(100000); // 設定I2C時脈為抗干擾100kHz
+  Wire.setTimeOut(10); // 強制設定I2C硬體超時為10毫秒防卡死
+
+  digitalWrite(PIN_XSHUT_L, HIGH); // 單獨喚醒左側測距模組
+  delay(20); // 等待左側模組啟動完成
+  sensorL.setTimeout(10); // 設定左側讀取超時為10毫秒
+  if (sensorL.init()) { // 嘗試初始化左側感測器
+    sensorL.setAddress(0x30); // 將左側模組位址修改為0x30
+    sensorL.setDistanceMode(VL53L1X::Long); // 設定為長距離模式支援4公尺
+    sensorL.setMeasurementTimingBudget(50000); // 設定單次測距時間預算50毫秒
+    sensorL.startContinuous(50); // 啟動連續測距週期50毫秒
+    leftOk = true; // 標記左側感測器運作正常
+  } // 結束左側初始化判斷
+
+  digitalWrite(PIN_XSHUT_R, HIGH); // 喚醒右側測距模組
+  delay(20); // 等待右側模組啟動完成
+  sensorR.setTimeout(10); // 設定右側讀取超時為10毫秒
+  if (sensorR.init()) { // 嘗試初始化右側感測器並保留預設位址0x29
+    sensorR.setDistanceMode(VL53L1X::Long); // 設定為長距離模式支援4公尺
+    sensorR.setMeasurementTimingBudget(50000); // 設定單次測距時間預算50毫秒
+    sensorR.startContinuous(50); // 啟動連續測距週期50毫秒
+    rightOk = true; // 標記右側感測器運作正常
+  } // 結束右側初始化判斷
+
+  WiFi.mode(WIFI_STA); // 切換無線模組為站台模式
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE); // 強制鎖定無線頻道為1
+  Serial.println(WiFi.macAddress()); // 印出本機MAC位址
+
+  if (esp_now_init() != ESP_OK) { // 初始化無線點對點協定
+    return; // 初始化失敗則提前結束
+  } // 結束初始化檢查
+
+  esp_now_peer_info_t peerInfo = {}; // 建立車頭端配對結構體
+  memcpy(peerInfo.peer_addr, frontMac, 6); // 複製車頭端MAC位址
+  peerInfo.channel = 1; // 指定通訊頻道為1
+  peerInfo.encrypt = false; // 關閉加密維持最低延遲
+  esp_now_add_peer(&peerInfo); // 將車頭端加入發射對象名單
+
+  setupWatchdog(); // 啟動看門狗監控機制
+} // 結束初始化函式
+
+void loop() { // 主迴圈函式
+  esp_task_wdt_reset(); // 定期餵狗避免系統自動重啟
+
+  if (leftOk && sensorL.dataReady()) { // 檢查左側感測器是否有新資料就緒
+    uint16_t rawL = sensorL.read(false); // 非阻塞讀取左側測距結果
+    if (!sensorL.timeoutOccurred() && sensorL.ranging_data.range_status == VL53L1X::RangeValid) { // 確認無超時且反射訊號有效
+      distL = rawL; // 更新左側有效距離毫米數
+    } else { // 無效反射或超出範圍時
+      distL = 9999; // 設為安全距離避免強光誤報
+    } // 結束左側有效性檢查
+  } // 結束左側讀取流程
+
+  if (rightOk && sensorR.dataReady()) { // 檢查右側感測器是否有新資料就緒
+    uint16_t rawR = sensorR.read(false); // 非阻塞讀取右側測距結果
+    if (!sensorR.timeoutOccurred() && sensorR.ranging_data.range_status == VL53L1X::RangeValid) { // 確認無超時且反射訊號有效
+      distR = rawR; // 更新右側有效距離毫米數
+    } else { // 無效反射或超出範圍時
+      distR = 9999; // 設為安全距離避免強光誤報
+    } // 結束右側有效性檢查
+  } // 結束右側讀取流程
+
+  unsigned long now = millis(); // 取得目前系統運行毫秒數
+  if (now - lastSendTime >= SEND_INTERVAL_MS) { // 每50毫秒發送一次狀態與心跳包
+    lastSendTime = now; // 更新發送計時器
+    bool alertL = (leftOk && distL >= MIN_DIST_MM && distL <= ALERT_DIST_MM); // 判斷左側盲區是否有來車
+    bool alertR = (rightOk && distR >= MIN_DIST_MM && distR <= ALERT_DIST_MM); // 判斷右側盲區是否有來車
+    char state = '0'; // 預設兩側皆無來車
+    if (alertL && alertR) { // 判斷是否左右兩側同時有車
+      state = '3'; // 設定雙側警戒代碼3
+    } else if (alertL) { // 判斷是否僅左側有車
+      state = '1'; // 設定左側警戒代碼1
+    } else if (alertR) { // 判斷是否僅右側有車
+      state = '2'; // 設定右側警戒代碼2
+    } // 結束盲區代碼組合
+    esp_now_send(frontMac, (uint8_t *)&state, sizeof(state)); // 傳送盲區封包給車頭端
+  } // 結束定時發送區塊
+} // 結束主迴圈函式
