@@ -1,1 +1,48 @@
+#include <WiFi.h> // 引入無線網路函式庫
+#include <esp_now.h> // 引入無線點對點通訊函式庫
+#include <esp_wifi.h> // 引入底層頻道設定函式庫
 
+const int PIN_UART_RX = 20; // 定義保留序列埠接收腳位
+const int PIN_UART_TX = 21; // 定義序列埠傳送腳位連接STM32接收腳
+const long UART_BAUD = 115200; // 定義與STM32對接鮑率
+
+volatile char latestCmd = 'N'; // 暫存最新收到的控制指令字元
+volatile bool hasNewCmd = false; // 標記是否有新封包待轉發
+
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3 // 判斷是否為新版核心
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) { // 新版無線接收回呼函式
+#else // 舊版核心分支
+void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) { // 舊版無線接收回呼函式
+#endif // 結束版本判斷
+  if (len >= 1) { // 確認收到封包長度至少為1位元組
+    char c = (char)data[0]; // 取出封包第一個字元
+    if (c == 'L' || c == 'R' || c == 'B' || c == 'N') { // 驗證是否為合法控制指令
+      latestCmd = c; // 寫入暫存指令變數
+      hasNewCmd = true; // 舉起待轉發旗標
+    } // 結束合法指令驗證
+  } // 結束封包長度判斷
+} // 結束無線接收回呼函式
+
+void setup() { // 開機初始化函式
+  Serial.begin(115200); // 啟動USB序列埠供電腦除錯觀察
+  Serial1.begin(UART_BAUD, SERIAL_8N1, PIN_UART_RX, PIN_UART_TX); // 啟動硬體序列埠輸出給STM32
+
+  WiFi.mode(WIFI_STA); // 切換無線模組為站台模式
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE); // 強制鎖定無線頻道為1
+  Serial.println(WiFi.macAddress()); // 印出安全帽端MAC位址供Node1填入
+
+  if (esp_now_init() != ESP_OK) { // 初始化無線點對點協定
+    return; // 初始化失敗則提前結束
+  } // 結束初始化檢查
+
+  esp_now_register_recv_cb(onDataRecv); // 註冊無線接收回呼函式
+} // 結束初始化函式
+
+void loop() { // 主迴圈函式
+  if (hasNewCmd) { // 檢查是否有新的無線指令到達
+    hasNewCmd = false; // 清除待轉發旗標
+    char cmdToSend = latestCmd; // 取出指令字元
+    Serial1.write((uint8_t)cmdToSend); // 立即透過GPIO21序列埠轉送給STM32
+    Serial.println(cmdToSend); // 同步印出至電腦除錯視窗確認運作
+  } // 結束轉發判斷
+} // 結束主迴圈函式
