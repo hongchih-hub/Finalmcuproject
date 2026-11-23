@@ -1,5 +1,5 @@
-# Finalmcuptoject
-機車警示系統
+# Finalmcuptoject-LumiScout
+機車警示系統LumiScout
 # 🏍️ 機車無線連動盲區偵測 安全帽外掛燈系統(實車路測三節點最終版)
 功能介紹網站(建議點入觀看):https://sites.google.com/view/finalmcuptojectmotorcyclewire/full-page-embed
 
